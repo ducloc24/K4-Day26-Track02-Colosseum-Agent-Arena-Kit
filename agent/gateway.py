@@ -113,6 +113,8 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+from agent.strategy import cheap_mask, pick_replica, successor_of
+from kit.mcp.specs import TOOL_SPECS
 
 __all__ = [
     "COMMAND_KINDS",
@@ -376,7 +378,21 @@ class Gateway:
         # helper is where this heuristic belongs; wire its answer in here by
         # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
         # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        # Work on a new Command: the arena-owned Command is an input snapshot.
+        # Always prefer the working replica unless this gateway has positive
+        # evidence that the path is drifting.  In particular, do not trust a
+        # model- or mutation-supplied replica header.
+        path_id = cmd.args.get("path_id")
+        if path_id is None:
+            path_id = cmd.args.get("path")
+        choice = pick_replica(path_id=path_id, known_drifting=False)
+        headers = dict(cmd.headers)
+        headers["mcp-replica"] = choice.replica
+        routed = Command(
+            cmd_id=cmd.cmd_id, kind=cmd.kind, raw=cmd.raw, server=cmd.server,
+            tool=cmd.tool, args=dict(cmd.args), fields=tuple(cmd.fields),
+            headers=headers, lease_id=cmd.lease_id, call_index=cmd.call_index,
+        )
 
         # ------------------------------------------------------------------
         # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
@@ -388,7 +404,15 @@ class Gateway:
         # and remember, `verdict="deny"` costs the caller ZERO credits
         # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
         # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
+        spec = TOOL_SPECS.get((routed.server, routed.tool))
+        if spec is not None and spec.needs_lease:
+            if routed.lease_id is None or routed.lease_id not in self.ctx.leases:
+                return self.deny(routed, "get_frame requires a live lease")
+        if spec is not None and spec.is_write:
+            if not routed.headers.get("if-match"):
+                return self.deny(routed, "write requires If-Match")
+            if not routed.headers.get("idempotency-key"):
+                return self.deny(routed, "write requires Idempotency-Key")
 
         # ------------------------------------------------------------------
         # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
@@ -402,8 +426,12 @@ class Gateway:
         # `verify_delegation` is the real worked example of an authority
         # check over a signed token, for the A2A-specific version of this
         # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
+        target = routed.args.get("learner") or routed.args.get("act")
+        if target is not None and target != self.ctx.act:
+            return self.deny(routed, f"target {target!r} is not owned by the learner")
+        required_scope = "wiki.write:progress" if spec is not None and spec.is_write else "wiki.read"
+        if required_scope not in self.ctx.scopes:
+            return self.deny(routed, f"missing scope {required_scope}")
 
         # ------------------------------------------------------------------
         # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
@@ -417,11 +445,37 @@ class Gateway:
         # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
         # REWRITE `routed.fields` down to the tool's cheap default instead
         # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
+        next_server, next_tool = routed.server, routed.tool
+        successor = successor_of(next_server, next_tool)
+        if successor is not None:
+            next_server, next_tool = successor
+
+        fields = tuple(routed.fields)
+        if fields in ((), ("*",)):
+            # The two catalog tools have deliberately expensive defaults.  For
+            # other tools, retain the spec's explicit default mask; this keeps
+            # the gateway from inventing fields the answer may not cite.
+            if (next_server, next_tool) == ("registry", "list_servers"):
+                fields = ("name",)
+            elif (next_server, next_tool) == ("glossary", "list_terms"):
+                fields = ("term",)
+            elif (next_server, next_tool) in TOOL_SPECS:
+                fields = tuple(TOOL_SPECS[(next_server, next_tool)].default_fields)
+        elif "*" in fields and (next_server, next_tool) in TOOL_SPECS:
+            fields = tuple(TOOL_SPECS[(next_server, next_tool)].default_fields)
+        fields = cheap_mask(next_server, next_tool, fields) if (next_server, next_tool) in TOOL_SPECS else fields
+
+        if (next_server, next_tool) != (routed.server, routed.tool) or fields != routed.fields or headers != cmd.headers:
+            routed = Command(
+                cmd_id=routed.cmd_id, kind=routed.kind, raw=routed.raw,
+                server=next_server, tool=next_tool, args=dict(routed.args),
+                fields=fields, headers=dict(headers), lease_id=routed.lease_id,
+                call_index=routed.call_index,
+            )
 
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        verdict = "rewrite" if routed.to_dict() != cmd.to_dict() else "forward"
+        decision = Decision(verdict=verdict, call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
